@@ -1,0 +1,148 @@
+name: Reusable - Extract Key Vault Secrets
+on:
+  workflow_call:
+    inputs:
+      keyvault-name:
+        description: "Name of the Azure Key Vault to read secrets from"
+        required: true
+        type: string
+      secrets-file:
+        description: "Path (relative to repo root) to the JSON file listing which secret names to fetch"
+        required: true
+        type: string
+      artifact-name:
+        description: "Name of the GitHub Actions artifact the populated JSON is uploaded as"
+        required: false
+        type: string
+        default: "extracted-secrets"
+      artifact-retention-days:
+        description: "How many days the artifact is kept before GitHub deletes it"
+        required: false
+        type: number
+        default: 1
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC federated login to Azure — do not remove
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC federated credential)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Extract secrets from Key Vault
+        env:
+          KEYVAULT_NAME: ${{ inputs.keyvault-name }}
+          SECRETS_FILE: ${{ inputs.secrets-file }}
+        run: |
+          # Reads $SECRETS_FILE, whose top-level keys are the NAMES of
+          # secrets that already exist in the Key Vault (values are
+          # ignored/blank on input), fetches each one's current value,
+          # masks it in the Actions log, and updates that same file in
+          # place with the real values — no separate output file is
+          # created. A secret that doesn't exist (or isn't readable) is
+          # left as an empty string rather than failing the whole run.
+          #
+          # This only edits the checked-out copy on the runner; it does
+          # not commit anything back to the repo. The updated file is
+          # picked up by the "Upload populated secrets as artifact" step
+          # below so it can be downloaded and checked.
+          set -euo pipefail
+
+          if [[ ! -f "$SECRETS_FILE" ]]; then
+            echo "::error::Secrets file not found: $SECRETS_FILE"
+            exit 1
+          fi
+
+          # Validate the input is a flat JSON object (name -> anything)
+          if ! jq -e 'type == "object"' "$SECRETS_FILE" > /dev/null; then
+            echo "::error::$SECRETS_FILE must be a flat object of secretName: value pairs"
+            exit 1
+          fi
+
+          SECRET_NAMES=$(jq -r 'keys[]' "$SECRETS_FILE")
+
+          if [[ -z "$SECRET_NAMES" ]]; then
+            echo "::error::No secret names found in $SECRETS_FILE"
+            exit 1
+          fi
+
+          MISSING_SECRETS=()
+
+          while IFS= read -r SECRET_NAME; do
+            echo "Fetching secret '$SECRET_NAME' from Key Vault '$KEYVAULT_NAME'..."
+
+            # Don't let a single missing/inaccessible secret abort the whole
+            # run — capture stderr and the exit code instead of relying on
+            # `set -e`.
+            set +e
+            SECRET_VALUE=$(az keyvault secret show \
+              --vault-name "$KEYVAULT_NAME" \
+              --name "$SECRET_NAME" \
+              --query "value" \
+              --output tsv \
+              2>"$RUNNER_TEMP/az-error.$$")
+            AZ_EXIT_CODE=$?
+            set -e
+
+            if [[ $AZ_EXIT_CODE -ne 0 ]]; then
+              echo "::warning::Secret '$SECRET_NAME' not found (or inaccessible) in Key Vault '$KEYVAULT_NAME' — leaving its value empty"
+              cat "$RUNNER_TEMP/az-error.$$" >&2
+              SECRET_VALUE=""
+              MISSING_SECRETS+=("$SECRET_NAME")
+            elif [[ -z "$SECRET_VALUE" ]]; then
+              echo "::warning::Secret '$SECRET_NAME' exists but its value is empty"
+            fi
+            rm -f "$RUNNER_TEMP/az-error.$$"
+
+            # Mask the value immediately so it never appears in plain text in
+            # logs, even if a later step or command echoes the variable by
+            # accident. (Masking an empty string is a harmless no-op.)
+            echo "::add-mask::$SECRET_VALUE"
+
+            # Update the value in place, without ever passing it as a shell
+            # argument to jq (avoids it showing up in process listings) —
+            # pass it via an environment variable and jq's env(). jq can't
+            # safely write to the file it's reading from, so write to a
+            # temp file first and then move it over the original.
+            SECRET_VALUE="$SECRET_VALUE" jq \
+              --arg key "$SECRET_NAME" \
+              '.[$key] = env.SECRET_VALUE' \
+              "$SECRETS_FILE" > "$RUNNER_TEMP/secrets-file.tmp"
+            mv "$RUNNER_TEMP/secrets-file.tmp" "$SECRETS_FILE"
+
+          done <<< "$SECRET_NAMES"
+
+          echo "Updated $SECRETS_FILE in place with the fetched values"
+
+          if [[ ${#MISSING_SECRETS[@]} -gt 0 ]]; then
+            echo "::warning::${#MISSING_SECRETS[@]} secret(s) were not found in the vault and were left empty: ${MISSING_SECRETS[*]}"
+          fi
+
+      - name: Azure logout
+        if: always()
+        run: az logout || true
+
+      - name: Upload updated secrets file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.secrets-file }}
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
