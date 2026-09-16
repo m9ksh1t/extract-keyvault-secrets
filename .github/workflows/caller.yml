@@ -21,9 +21,8 @@ on:
         type: string
       secrets-file:
         description: "Path to the JSON secrets file"
-        required: false
+        required: true
         type: string
-        default: "config/secrets-list.json"
 
 jobs:
   manage-secrets:
