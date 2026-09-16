@@ -1,33 +1,41 @@
-name: Extract Secrets
+name: Manage Key Vault Secrets
 
-# Caller workflow. Triggers the reusable workflow that logs into Azure and
-# pulls the secret values named in config/secrets-list.json out of the
-# Key Vault, producing a populated JSON artifact.
+# Single caller workflow for both directions. Triggers the reusable
+# workflow, which picks one of its two jobs (extract or upsert) based on
+# the "operation" input below.
 
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: "extract = pull values out of the vault into the file. upsert = push name/value pairs from the file into the vault (create if missing, update if present)."
+        required: true
+        type: choice
+        options:
+          - extract
+          - upsert
+        default: extract
       keyvault-name:
         description: "Azure Key Vault name"
         required: true
         type: string
       secrets-file:
-        description: "Path to the JSON file listing secret names"
+        description: "Path to the JSON secrets file"
         required: false
         type: string
         default: "config/secrets-list.json"
 
 jobs:
-  extract-secrets:
+  manage-secrets:
     permissions:
       contents: read
       id-token: write # required so the reusable workflow can request an OIDC token for Azure login
-    uses: ./.github/workflows/reusable-keyvault-extract.yml
+    uses: ./.github/workflows/reusable-keyvault-secrets.yml
     with:
+      operation: ${{ inputs.operation }}
       keyvault-name: ${{ inputs.keyvault-name }}
       secrets-file: ${{ inputs.secrets-file }}
       artifact-name: "extracted-secrets"
-      artifact-retention-days: 1
     secrets:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}

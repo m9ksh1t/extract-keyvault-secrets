@@ -1,25 +1,46 @@
-name: Reusable - Extract Key Vault Secrets
+name: Reusable - Key Vault Secrets (Extract / Upsert)
+
+# This workflow is not meant to be run directly. It is called from another
+# workflow via `uses:` (see .github/workflows/manage-secrets.yml for an
+# example caller).
+#
+# Single reusable workflow covering both directions against the same
+# config/secrets-list.json file, selected via the `operation` input:
+#
+#   operation: extract
+#     Reads secret NAMES from the file (values ignored/blank on input),
+#     pulls each one's current value out of the Key Vault, and updates the
+#     file in place with the real values.
+#
+#   operation: upsert
+#     Reads secret NAME/VALUE pairs from the file and pushes them into the
+#     Key Vault — creating any secret that doesn't exist yet, and adding a
+#     new version to any secret that already does.
+#
+# Only one of the two jobs actually runs on a given call, chosen by the
+# `validate-operation` job's output. Neither job commits anything back to
+# the repository; both only touch the runner's checked-out copy of the file.
+
 on:
   workflow_call:
     inputs:
+      operation:
+        description: "Which job to run: 'extract' or 'upsert'"
+        required: true
+        type: string
       keyvault-name:
-        description: "Name of the Azure Key Vault to read secrets from"
+        description: "Name of the Azure Key Vault to read from / write to"
         required: true
         type: string
       secrets-file:
-        description: "Path (relative to repo root) to the JSON file listing which secret names to fetch"
+        description: "Path (relative to repo root) to the JSON secrets file"
         required: true
         type: string
       artifact-name:
-        description: "Name of the GitHub Actions artifact the populated JSON is uploaded as"
+        description: "(extract only) Name of the GitHub Actions artifact the populated JSON is uploaded as"
         required: false
         type: string
         default: "extracted-secrets"
-      artifact-retention-days:
-        description: "How many days the artifact is kept before GitHub deletes it"
-        required: false
-        type: number
-        default: 1
     secrets:
       AZURE_CLIENT_ID:
         required: true
@@ -33,7 +54,25 @@ permissions:
   id-token: write # required for OIDC federated login to Azure — do not remove
 
 jobs:
+  validate-operation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the "operation" input
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          if [[ "$OPERATION" != "extract" && "$OPERATION" != "upsert" ]]; then
+            echo "::error::'operation' must be either 'extract' or 'upsert' — got '$OPERATION'"
+            exit 1
+          fi
+          echo "operation='$OPERATION' is valid."
+
+  # ---------------------------------------------------------------------
+  # extract: pull values OUT of the vault, into the file
+  # ---------------------------------------------------------------------
   extract:
+    needs: validate-operation
+    if: inputs.operation == 'extract'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -144,5 +183,147 @@ jobs:
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.secrets-file }}
-          retention-days: ${{ inputs.artifact-retention-days }}
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # upsert: push values IN to the vault, from the file
+  # ---------------------------------------------------------------------
+  upsert:
+    needs: validate-operation
+    if: inputs.operation == 'upsert'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC federated credential)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create/update secrets in Key Vault
+        env:
+          KEYVAULT_NAME: ${{ inputs.keyvault-name }}
+          SECRETS_FILE: ${{ inputs.secrets-file }}
+        run: |
+          # Reads $SECRETS_FILE as a flat object of secretName: secretValue
+          # pairs. For each pair:
+          #   - if no secret with that name exists in the vault, it is created
+          #   - if a secret with that name already exists, a new version of
+          #     it is set (Key Vault secrets are versioned, so "update" means
+          #     adding a new version under the same name)
+          # A secret whose value is blank ("") is skipped with a warning
+          # rather than pushed, since that's almost always a placeholder
+          # that was never filled in. Any secret that fails to create/update
+          # is reported by name, and the run fails overall if any did,
+          # without aborting the rest of the batch.
+          set -euo pipefail
+
+          if [[ ! -f "$SECRETS_FILE" ]]; then
+            echo "::error::Secrets file not found: $SECRETS_FILE"
+            exit 1
+          fi
+
+          # Validate the input is a flat JSON object (name -> value)
+          if ! jq -e 'type == "object"' "$SECRETS_FILE" > /dev/null; then
+            echo "::error::$SECRETS_FILE must be a flat object of secretName: secretValue pairs"
+            exit 1
+          fi
+
+          ENTRIES=$(jq -c 'to_entries[]' "$SECRETS_FILE")
+
+          if [[ -z "$ENTRIES" ]]; then
+            echo "::error::No secrets found in $SECRETS_FILE"
+            exit 1
+          fi
+
+          FAILED_SECRETS=()
+          CREATED_COUNT=0
+          UPDATED_COUNT=0
+          SKIPPED_COUNT=0
+
+          while IFS= read -r ENTRY; do
+            SECRET_NAME=$(jq -r '.key' <<< "$ENTRY")
+            # Coerce a null/non-string value to an empty string rather than
+            # the literal text "null".
+            SECRET_VALUE=$(jq -r '(.value // "") | tostring' <<< "$ENTRY")
+
+            # Mask the value immediately, before anything else touches it.
+            echo "::add-mask::$SECRET_VALUE"
+
+            if [[ -z "$SECRET_NAME" || "$SECRET_NAME" == "null" ]]; then
+              echo "::warning::Skipping an entry with an empty/invalid secret name"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            if [[ -z "$SECRET_VALUE" ]]; then
+              echo "::warning::Skipping secret '$SECRET_NAME' because its value is empty"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            # Check whether the secret already exists, purely to log
+            # "creating" vs "updating" accurately — az keyvault secret set
+            # creates-or-updates either way in a single call.
+            set +e
+            az keyvault secret show \
+              --vault-name "$KEYVAULT_NAME" \
+              --name "$SECRET_NAME" \
+              --query "id" \
+              --output tsv > /dev/null 2>"$RUNNER_TEMP/kv-show.$$"
+            EXISTS_EXIT_CODE=$?
+            set -e
+            rm -f "$RUNNER_TEMP/kv-show.$$"
+
+            if [[ $EXISTS_EXIT_CODE -eq 0 ]]; then
+              ACTION="update"
+            else
+              ACTION="create"
+            fi
+            echo "Attempting to $ACTION secret '$SECRET_NAME' in Key Vault '$KEYVAULT_NAME'..."
+
+            # Write the value to a short-lived temp file rather than passing
+            # it as a CLI argument, so it never shows up in a process listing.
+            printf '%s' "$SECRET_VALUE" > "$RUNNER_TEMP/secret-value.$$"
+
+            set +e
+            az keyvault secret set \
+              --vault-name "$KEYVAULT_NAME" \
+              --name "$SECRET_NAME" \
+              --file "$RUNNER_TEMP/secret-value.$$" \
+              --output none \
+              2>"$RUNNER_TEMP/kv-set-error.$$"
+            SET_EXIT_CODE=$?
+            set -e
+
+            rm -f "$RUNNER_TEMP/secret-value.$$"
+
+            if [[ $SET_EXIT_CODE -ne 0 ]]; then
+              echo "::error::Failed to $ACTION secret '$SECRET_NAME' in Key Vault '$KEYVAULT_NAME'"
+              cat "$RUNNER_TEMP/kv-set-error.$$" >&2
+              FAILED_SECRETS+=("$SECRET_NAME")
+            else
+              echo "Successfully ${ACTION}d secret '$SECRET_NAME'"
+              if [[ "$ACTION" == "create" ]]; then
+                CREATED_COUNT=$((CREATED_COUNT + 1))
+              else
+                UPDATED_COUNT=$((UPDATED_COUNT + 1))
+              fi
+            fi
+            rm -f "$RUNNER_TEMP/kv-set-error.$$"
+
+          done <<< "$ENTRIES"
+
+          echo "Done. Created: $CREATED_COUNT, Updated: $UPDATED_COUNT, Skipped: $SKIPPED_COUNT, Failed: ${#FAILED_SECRETS[@]}"
+
+          if [[ ${#FAILED_SECRETS[@]} -gt 0 ]]; then
+            echo "::error::${#FAILED_SECRETS[@]} secret(s) failed to create/update: ${FAILED_SECRETS[*]}"
+            exit 1
+          fi
+
+      - name: Azure logout
+        if: always()
+        run: az logout || true
